@@ -5,3 +5,8 @@ export function generateSha256(src: string) {
   sha256.update(src)
   return sha256.digest('hex')
 }
+
+
+export function sleep(msec: number) {
+  new Promise(resolve => setTimeout(resolve, msec))
+}

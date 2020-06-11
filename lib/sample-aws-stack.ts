@@ -8,49 +8,65 @@ import apigateway = require("@aws-cdk/aws-apigateway");
 import { Duration } from '@aws-cdk/core'
 import * as cfn from '@aws-cdk/aws-cloudformation'
 import * as cr from '@aws-cdk/custom-resources'
-import { generateSha256 } from '../src/utils/util'
-import { LambdaEdgeEventType } from '@aws-cdk/aws-cloudfront'
+import { LambdaEdgeEventType, LambdaFunctionAssociation } from '@aws-cdk/aws-cloudfront'
+import { generateSha256, sleep } from '../src/utils/util'
+import { PreProcess } from './aws-api-stack-preprocess'
+import fs = require('fs')
 
-export class SampleAwsStack extends cdk.Stack {
+export class SampleAws3Stack extends cdk.Stack {
+  response: any
+
   constructor(scope: cdk.Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props)
+    
+    const bundleLayer = new lambda.LayerVersion(this, 'lambdaBundleLayer', {
+      layerVersionName: 'aws-api-bundle-layer',
+      code: new lambda.AssetCode(PreProcess.BUNDLE_LAYER_BASE_DIR),
+      compatibleRuntimes: [lambda.Runtime.NODEJS_10_X],
+    })
 
-    // const lambdaProvider = new lambda.SingletonFunction(this, 'Provider', {
-    //   uuid: 'f7d4f730-4ee1-11e8-9c2d-fa7ae01bbebc',
-    //   code: lambda.Code.asset('./cfn'),
-    //   handler: 'stack.handler',
-    //   timeout: Duration.seconds(3),
+    const lambdaProvider = new lambda.SingletonFunction(this, 'Provider', {
+      uuid: 'f7d4f730-4ee1-11e8-9c2d-fa7ae01bbebc', 
+      // code: lambda.Code.fromAsset('src/'),
+      // handler: `lambda/stack.handler`,
+      layers: [bundleLayer],
+      code: new lambda.InlineCode(fs.readFileSync('src/lambda/stack.js', { encoding: 'utf-8' })),
+      handler: 'index.handler',
+      timeout: cdk.Duration.seconds(60),
+      runtime: lambda.Runtime.NODEJS_10_X,
+    })
+
+    // const completedProvider = new lambda.SingletonFunction(this, 'Completed', {
+    //   uuid: 'f7d4f730-4ee1-11e8-9c2d-fa7ae01bbebc', 
+    //   code: lambda.Code.fromAsset('src/'),
+    //   layers: [bundleLayer],
+    //   handler: `lambda/completed.handler`,
+    //   timeout: cdk.Duration.seconds(10),
     //   runtime: lambda.Runtime.NODEJS_10_X,
     // })
 
-    // const stackOutput = new cfn.CustomResource(this, 'StackOutput', {
-    //   provider: new cr.Provider(this, 'StackOutputProvider', {
-    //     onEventHandler: lambdaProvider
-    //   }),
-    //   properties: {
-    //     StackName: id,
-    //     OutputKey: 'LambdaOutput',
-    //     // just to change custom resource on code update
-    //     LambdaHash: generateSha256('./src/lambda/edge.handler')
-    //   }
+   
+    lambdaProvider.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['cloudformation:DescribeStacks'],
+        resources: [`arn:aws:cloudformation:*:*:stack/SampleLambdaStack/*`]
+      })
+    );
+
+    // const provider = new cr.Provider(this, 'StackOutputProvider', {
+    //   onEventHandler: lambdaProvider,
     // })
 
-    const override = new lambda.Function(this, 'lambdaEdge', {
-      code: lambda.Code.asset('src/'),
-      handler: `lambda/edge.handler`,
-      runtime: lambda.Runtime.NODEJS_10_X,
-      timeout: Duration.seconds(3)
+   // This basically goes to another region to edge stack and grabs the version output
+    const stackOutput = new cfn.CustomResource(this, 'StackOutput', {
+      // provider: provider,
+      provider: cfn.CustomResourceProvider.fromLambda(lambdaProvider),
+      properties: {
+        StackName: 'SampleLambdaStack',
+        OutputKey: 'LambdaOutput',
+        LambdaHash: ':sha256:' + generateSha256('./lambda/index.js')
+      }
     })
-
-   const version = override.addVersion(':sha256:' + generateSha256('./src/lambda/edge.js'))
-
-    // // the main magic to easily pass the lambda version to stack in another region
-    // const a = new cdk.CfnOutput(this, 'lambdaEdge', {
-    //   value: cdk.Fn.join(":", [
-    //     override.functionArn,
-    //     version.version
-    //   ])
-    // });
 
     const testAppBucket = new s3.Bucket(this, 's3-cloudfront-test-123')
 
@@ -64,9 +80,11 @@ export class SampleAwsStack extends cdk.Stack {
     })
     testAppBucket.addToResourcePolicy(policy)
 
+    this.response = stackOutput.getAtt('Output').toString()
 
-
-    const cfs = new cloudfront.CloudFrontWebDistribution(this, 'WebsiteDistribution', {
+    const version = lambda.Version.fromVersionArn(this, 'Version', this.response)
+    
+    new cloudfront.CloudFrontWebDistribution(this, 'WebsiteDistribution', {
       priceClass: cloudfront.PriceClass.PRICE_CLASS_ALL,
       originConfigs: [
         {
@@ -80,16 +98,15 @@ export class SampleAwsStack extends cdk.Stack {
               minTtl: cdk.Duration.seconds(0),
               maxTtl: cdk.Duration.days(365),
               defaultTtl: cdk.Duration.days(1),
-              lambdaFunctionAssociations: [
-                {
-                  eventType: LambdaEdgeEventType.ORIGIN_RESPONSE,
-                  lambdaFunction: version
-                }
-              ]
+              lambdaFunctionAssociations: [{
+                eventType: LambdaEdgeEventType.ORIGIN_RESPONSE,
+                lambdaFunction: version
+              }]
             },
           ],
         },
       ],
+
       errorConfigurations: [
         {
           errorCode: 403,
@@ -106,21 +123,11 @@ export class SampleAwsStack extends cdk.Stack {
       ],
     })
 
-    // const cfDist = cf.node.findChild('CFDistribution') as cloudfront.CfnDistribution;
-
-    // const lambdaEdge = new lambda.Function(this, 'lambdaEdge', {
-    //   code: lambda.Code.asset('src/'),
-    //   handler: `lambda/edge.handler`,
-    //   runtime: lambda.Runtime.NODEJS_10_X,
-    //   timeout: Duration.seconds(3)
-    // })
-
-    // // // // Manually add the LambdaFunctionAssociations by adding an override
-    // cfDist.addOverride('Properties.DistributionConfig.DefaultCacheBehavior.LambdaFunctionAssociations', [{
-    //   EventType: 'origin-response',
-    //   LambdaFunction: lambdaEdge
-    // }]);
-    
-    
+    new cdk.CfnOutput(this, 'LambdaEdge', {
+      value: this.response
+    })
   }
+
 }
+
+PreProcess.generateBundlePackage()
